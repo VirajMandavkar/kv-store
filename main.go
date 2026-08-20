@@ -11,8 +11,22 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 )
+
+type walRequest struct {
+	logLine string
+	receipt chan error
+}
+
+var (
+	// The actual database
+	kvStore = make(map[string]string)
+	// The lock to prevent concurrent write crashes
+	mu      sync.RWMutex
+	walFile *os.File
+)
+
+var walChan = make(chan walRequest, 10000)
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
@@ -24,12 +38,12 @@ func handleConnection(conn net.Conn) {
 		// 2. Read exactly 4 bytes from the network stream
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
-			fmt.Printf("Client disconnected or read error: %v\n", err)
+			//fmt.Printf("Client disconnected or read error: %v\n", err)
 			return // Kill the goroutine if the client drops
 		}
 		// 3. Translate those raw bytes into an actual integer
 		msgLength := binary.BigEndian.Uint32(header)
-		fmt.Printf("Incoming message length: %d bytes \n", msgLength)
+		//fmt.Printf("Incoming message length: %d bytes \n", msgLength)
 
 		// Create a new buffer dynamically sized to the exact length of the payload
 		payload := make([]byte, msgLength)
@@ -37,12 +51,12 @@ func handleConnection(conn net.Conn) {
 		// Block and read exactly that many bytes from the socket
 		_, err = io.ReadFull(conn, payload)
 		if err != nil {
-			fmt.Printf("Failed to read payload: %v\n", err)
+			//fmt.Printf("Failed to read payload: %v\n", err)
 			return
 		}
 
 		// Print the actual command
-		fmt.Printf("Received command: %s\n", string(payload))
+		//fmt.Printf("Received command: %s\n", string(payload))
 
 		// Parsing the payload
 		parts := strings.Split(string(payload), " ")
@@ -60,17 +74,26 @@ func handleConnection(conn net.Conn) {
 				key := parts[1]
 				value := strings.Join(parts[2:], " ")
 
-				mu.Lock()
 				logLine := fmt.Sprintf("SET %s %s\n", key, value)
-				if _, err := walFile.WriteString(logLine); err != nil {
-					fmt.Printf("WAL write failed; %v\n", err)
+				rec := make(chan error, 1)
+
+				walReq := walRequest{
+					logLine: logLine,
+					receipt: rec,
 				}
 
-				kvStore[key] = value
-				mu.Unlock()
+				walChan <- walReq
+				err := <-rec
 
-				response = "OK"
-				fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
+				if err == nil {
+					mu.Lock()
+					kvStore[key] = value
+					mu.Unlock()
+					response = "OK"
+					//fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
+				} else {
+					response = "ERROR: disk sync failed"
+				}
 			} else {
 				response = "ERROR: syntax"
 			}
@@ -87,7 +110,7 @@ func handleConnection(conn net.Conn) {
 					response = value
 				} else {
 					response = "Key Don't Exist"
-					fmt.Printf("Key : %s Don't exist in memory\n", key)
+					//fmt.Printf("Key : %s Don't exist in memory\n", key)
 				}
 			} else {
 				response = "ERROR : syntax"
@@ -97,23 +120,33 @@ func handleConnection(conn net.Conn) {
 			if len(parts) == 2 {
 				key := parts[1]
 
-				mu.Lock()
-				//. Writing to log file
 				logLine := fmt.Sprintf("DEL %s\n", key)
-				if _, err := walFile.WriteString(logLine); err != nil {
-					fmt.Printf("WAL write failed: %v\n", err)
-				}
-				_, exists := kvStore[key]
-				if exists {
-					response = "Successful Deletion"
-					fmt.Printf("Deleted from memory: %s -[%s]\n", key, kvStore[key])
-					delete(kvStore, key)
-				} else {
-					response = "Key Don't Exist"
-					fmt.Printf("Key : %s Don't exist in memory", key)
+				rec := make(chan error, 1)
+
+				walReq := walRequest{
+					logLine: logLine,
+					receipt: rec,
 				}
 
-				mu.Unlock()
+				walChan <- walReq
+				err := <-rec
+				if err == nil {
+					mu.Lock()
+
+					_, exists := kvStore[key]
+					if exists {
+						response = "Successful Deletion"
+						fmt.Printf("Deleted from memory: %s -[%s]\n", key, kvStore[key])
+						delete(kvStore, key)
+					} else {
+						response = "Key Don't Exist"
+						fmt.Printf("Key : %s Don't exist in memory", key)
+					}
+
+					mu.Unlock()
+				} else {
+					response = "ERROR: disk sync failed"
+				}
 
 			} else {
 				response = "ERROR: Synyax"
@@ -167,14 +200,6 @@ func loadWAL() {
 	fmt.Printf("Startup: Loaded %d keys from WAL into memory\n", len(kvStore))
 }
 
-var (
-	// The actual database
-	kvStore = make(map[string]string)
-	// The lock to prevent concurrent write crashes
-	mu      sync.RWMutex
-	walFile *os.File
-)
-
 func main() {
 	// 1. Rebuilding memory from disk BEFORE starting the server
 	loadWAL()
@@ -183,7 +208,7 @@ func main() {
 	var err error
 	walFile, err = os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Printf("Fatal: failed to open WAL: %v\n", err)
+		//fmt.Printf("Fatal: failed to open WAL: %v\n", err)
 		os.Exit(1)
 	}
 	defer walFile.Close()
@@ -199,20 +224,39 @@ func main() {
 	}()
 
 	// 4. background WAL flusher
-	ticker := time.NewTicker(1 * time.Second)
 
 	go func() {
-		for range ticker.C {
-			if err := walFile.Sync(); err != nil {
-				fmt.Printf("Background sync failed: %v\n", err)
+		var batch []walRequest
+
+		for {
+			req := <-walChan
+			batch = append(batch, req)
+		drainLoop:
+			for len(batch) < 100 {
+				select {
+				case nextReq := <-walChan:
+					batch = append(batch, nextReq)
+				default:
+					break drainLoop
+				}
 			}
+			for _, r := range batch {
+				walFile.WriteString(r.logLine)
+			}
+			syncErr := walFile.Sync()
+
+			for _, r := range batch {
+				r.receipt <- syncErr
+			}
+			batch = batch[:0]
 		}
+
 	}()
 
 	// 5. Start the listener on port 8080
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		fmt.Printf("Failed to bind to prt: %v\n", err)
+		//fmt.Printf("Failed to bind to prt: %v\n", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
@@ -224,7 +268,7 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Printf("Failed to accept connection: %v\n", err)
+			//fmt.Printf("Failed to accept connection: %v\n", err)
 			continue
 		}
 		go handleConnection(conn)
