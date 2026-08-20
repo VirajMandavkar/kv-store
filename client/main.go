@@ -44,11 +44,16 @@ func main() {
 	defer conn.Close()
 
 	// 1. Send a SET command
-	sendCommand(conn, "SET profile viraj_devops")
+	//sendCommand(conn, "SET profile viraj_devops")
 
 	// 2. Send a GET command to retrieve what we just saved
 	sendCommand(conn, "GET profile")
 
 	// 3. Try to GET something that doesn't exist
 	sendCommand(conn, "GET missing_key")
+
+	sendCommand(conn, "SET profile hello")
+	sendCommand(conn, "DEL profile")
+	sendCommand(conn, "DEL profi")
+
 }

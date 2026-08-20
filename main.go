@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 )
 
 func handleConnection(conn net.Conn) {
@@ -57,6 +60,14 @@ func handleConnection(conn net.Conn) {
 				value := strings.Join(parts[2:], " ")
 
 				mu.Lock()
+				logLine := fmt.Sprintf("SET %s %s\n", key, value)
+				if _, err := walFile.WriteString(logLine); err != nil {
+					fmt.Printf("WAL write failed; %v\n", err)
+				}
+
+				if err := walFile.Sync(); err != nil {
+					fmt.Printf("WAL sync failed: %v\n", err)
+				}
 				kvStore[key] = value
 				mu.Unlock()
 
@@ -77,10 +88,38 @@ func handleConnection(conn net.Conn) {
 				if exists {
 					response = value
 				} else {
-					response = "(nil)"
+					response = "Key Don't Exist"
+					fmt.Printf("Key : %s Don't exist in memory\n", key)
 				}
 			} else {
 				response = "ERROR : syntax"
+			}
+
+		case "DEL":
+			if len(parts) == 2 {
+				key := parts[1]
+
+				mu.Lock()
+				//. Writing to log file
+				logLine := fmt.Sprintf("DEL %s\n", key)
+				if _, err := walFile.WriteString(logLine); err != nil {
+					fmt.Printf("WAL write failed: %v\n", err)
+				}
+				walFile.Sync()
+				_, exists := kvStore[key]
+				if exists {
+					response = "Successful Deletion"
+					fmt.Printf("Deleted from memory: %s -[%s]\n", key, kvStore[key])
+					delete(kvStore, key)
+				} else {
+					response = "Key Don't Exist"
+					fmt.Printf("Key : %s Don't exist in memory", key)
+				}
+
+				mu.Unlock()
+
+			} else {
+				response = "ERROR: Synyax"
 			}
 
 		default:
@@ -96,15 +135,73 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+func loadWAL() {
+	file, err := os.Open("wal.log")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return
+		}
+		panic(fmt.Sprintf("Failed to read WAL: %v\n", err))
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, " ")
+		if len(parts) == 0 {
+			continue
+		}
+
+		command := parts[0]
+		if command == "SET" && len(parts) >= 3 {
+			key := parts[1]
+			value := strings.Join(parts[2:], " ")
+			kvStore[key] = value
+		} else if command == "DEL" && len(parts) == 2 {
+			delete(kvStore, parts[1])
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		panic(fmt.Sprintf("Failed to read file: %v\n", err))
+	}
+
+	fmt.Printf("Startup: Loaded %d keys from WAL into memory\n", len(kvStore))
+}
+
 var (
 	// The actual database
 	kvStore = make(map[string]string)
 	// The lock to prevent concurrent write crashes
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	walFile *os.File
 )
 
 func main() {
-	// 1. Start the listener on port 8080
+	// 1. Rebuilding memory from disk BEFORE starting the server
+	loadWAL()
+
+	// 2. Open the WAL for appending new commands
+	var err error
+	walFile, err = os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Printf("Fatal: failed to open WAL: %v\n", err)
+		os.Exit(1)
+	}
+	defer walFile.Close()
+
+	// 3. SetUp Graceful shutdown trap
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Println("\n Recieived shutdown signal . Flushing WAL and exiting ..")
+		walFile.Close()
+		os.Exit(0)
+	}()
+
+	// 4. Start the listener on port 8080
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		fmt.Printf("Failed to bind to prt: %v\n", err)
@@ -114,7 +211,7 @@ func main() {
 
 	fmt.Println("KV Store TCP server listening on :8080")
 
-	//2.The infinite Accept Loop
+	//5.The infinite Accept Loop
 
 	for {
 		conn, err := ln.Accept()
