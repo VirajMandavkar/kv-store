@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 func handleConnection(conn net.Conn) {
@@ -65,9 +66,6 @@ func handleConnection(conn net.Conn) {
 					fmt.Printf("WAL write failed; %v\n", err)
 				}
 
-				if err := walFile.Sync(); err != nil {
-					fmt.Printf("WAL sync failed: %v\n", err)
-				}
 				kvStore[key] = value
 				mu.Unlock()
 
@@ -105,7 +103,6 @@ func handleConnection(conn net.Conn) {
 				if _, err := walFile.WriteString(logLine); err != nil {
 					fmt.Printf("WAL write failed: %v\n", err)
 				}
-				walFile.Sync()
 				_, exists := kvStore[key]
 				if exists {
 					response = "Successful Deletion"
@@ -201,7 +198,18 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 4. Start the listener on port 8080
+	// 4. background WAL flusher
+	ticker := time.NewTicker(1 * time.Second)
+
+	go func() {
+		for range ticker.C {
+			if err := walFile.Sync(); err != nil {
+				fmt.Printf("Background sync failed: %v\n", err)
+			}
+		}
+	}()
+
+	// 5. Start the listener on port 8080
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
 		fmt.Printf("Failed to bind to prt: %v\n", err)
@@ -211,7 +219,7 @@ func main() {
 
 	fmt.Println("KV Store TCP server listening on :8080")
 
-	//5.The infinite Accept Loop
+	//6.The infinite Accept Loop
 
 	for {
 		conn, err := ln.Accept()
