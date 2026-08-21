@@ -38,12 +38,12 @@ func handleConnection(conn net.Conn) {
 		// 2. Read exactly 4 bytes from the network stream
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
-			//fmt.Printf("Client disconnected or read error: %v\n", err)
+			fmt.Printf("Client disconnected or read error: %v\n", err)
 			return // Kill the goroutine if the client drops
 		}
 		// 3. Translate those raw bytes into an actual integer
 		msgLength := binary.BigEndian.Uint32(header)
-		//fmt.Printf("Incoming message length: %d bytes \n", msgLength)
+		fmt.Printf("Incoming message length: %d bytes \n", msgLength)
 
 		// Create a new buffer dynamically sized to the exact length of the payload
 		payload := make([]byte, msgLength)
@@ -56,7 +56,7 @@ func handleConnection(conn net.Conn) {
 		}
 
 		// Print the actual command
-		//fmt.Printf("Received command: %s\n", string(payload))
+		fmt.Printf("Received command: %s\n", string(payload))
 
 		// Parsing the payload
 		parts := strings.Split(string(payload), " ")
@@ -90,7 +90,7 @@ func handleConnection(conn net.Conn) {
 					kvStore[key] = value
 					mu.Unlock()
 					response = "OK"
-					//fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
+					fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
 				} else {
 					response = "ERROR: disk sync failed"
 				}
@@ -110,7 +110,7 @@ func handleConnection(conn net.Conn) {
 					response = value
 				} else {
 					response = "Key Don't Exist"
-					//fmt.Printf("Key : %s Don't exist in memory\n", key)
+					fmt.Printf("Key : %s Don't exist in memory\n", key)
 				}
 			} else {
 				response = "ERROR : syntax"
@@ -208,7 +208,7 @@ func main() {
 	var err error
 	walFile, err = os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		//fmt.Printf("Fatal: failed to open WAL: %v\n", err)
+		fmt.Printf("Fatal: failed to open WAL: %v\n", err)
 		os.Exit(1)
 	}
 	defer walFile.Close()
@@ -256,7 +256,7 @@ func main() {
 	// 5. Start the listener on port 8080
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		//fmt.Printf("Failed to bind to prt: %v\n", err)
+		fmt.Printf("Failed to bind to prt: %v\n", err)
 		os.Exit(1)
 	}
 	defer ln.Close()
@@ -268,7 +268,7 @@ func main() {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			//fmt.Printf("Failed to accept connection: %v\n", err)
+			fmt.Printf("Failed to accept connection: %v\n", err)
 			continue
 		}
 		go handleConnection(conn)
