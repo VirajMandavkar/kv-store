@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"math/rand"
 )
 
@@ -65,6 +66,8 @@ func (sl *SkipList) Put(key, value string) {
 		// We've gone as far as we can on track 'i'. Leave a breadcrumb.
 		update[i] = current
 	}
+
+	fmt.Println("Hello")
 
 	// 3. Drop to the local track (Level 0) to check the station immediately in front of us.
 	current = current.next[0]
