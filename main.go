@@ -18,15 +18,17 @@ type walRequest struct {
 	receipt chan error
 }
 
-var (
-	// The actual database
-	kvStore = make(map[string]string)
-	// The lock to prevent concurrent write crashes
-	mu      sync.RWMutex
-	walFile *os.File
-)
+const MemTableLimit = 100 * 1024 // 1 MB limit
 
-var walChan = make(chan walRequest, 10000)
+var (
+	activeMem  = NewSkipList()
+	immutMem   *SkipList
+	mu         sync.RWMutex
+	walFile    *os.File
+	walChan    = make(chan walRequest, 10000)
+	flushChan  = make(chan *SkipList, 1)
+	sstCounter = 0
+)
 
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
@@ -38,12 +40,12 @@ func handleConnection(conn net.Conn) {
 		// 2. Read exactly 4 bytes from the network stream
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
-			fmt.Printf("Client disconnected or read error: %v\n", err)
+			//fmt.Printf("Client disconnected or read error: %v\n", err)
 			return // Kill the goroutine if the client drops
 		}
 		// 3. Translate those raw bytes into an actual integer
 		msgLength := binary.BigEndian.Uint32(header)
-		fmt.Printf("Incoming message length: %d bytes \n", msgLength)
+		//fmt.Printf("Incoming message length: %d bytes \n", msgLength)
 
 		// Create a new buffer dynamically sized to the exact length of the payload
 		payload := make([]byte, msgLength)
@@ -56,10 +58,11 @@ func handleConnection(conn net.Conn) {
 		}
 
 		// Print the actual command
-		fmt.Printf("Received command: %s\n", string(payload))
+		//fmt.Printf("Received command: %s\n", string(payload))
 
 		// Parsing the payload
-		parts := strings.Split(string(payload), " ")
+		cleanPayload := strings.TrimSpace(string(payload))
+		parts := strings.Split(string(cleanPayload), " ")
 
 		if len(parts) == 0 {
 			continue
@@ -87,10 +90,20 @@ func handleConnection(conn net.Conn) {
 
 				if err == nil {
 					mu.Lock()
-					kvStore[key] = value
+					activeMem.Put(key, value)
+					if activeMem.size >= MemTableLimit {
+						immutMem = activeMem
+						activeMem = NewSkipList()
+						select {
+						case flushChan <- immutMem:
+							fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
+						default:
+							fmt.Println("\n[WARNING] SSD is too slow! Background flusher is falling behind.")
+						}
+					}
 					mu.Unlock()
 					response = "OK"
-					fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
+					//fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
 				} else {
 					response = "ERROR: disk sync failed"
 				}
@@ -101,12 +114,31 @@ func handleConnection(conn net.Conn) {
 		case "GET":
 			if len(parts) == 2 {
 				key := parts[1]
+				var value string
+				var exists bool
 
 				mu.RLock()
-				value, exists := kvStore[key]
+				value, exists = activeMem.Get(key)
+
+				if !exists && immutMem != nil {
+					value, exists = immutMem.Get(key)
+				}
 				mu.RUnlock()
 
-				if exists {
+				if !exists {
+					mu.RLock()
+					maxFiles := sstCounter
+					mu.RUnlock()
+
+					for i := maxFiles - 1; i >= 0; i-- {
+						filename := fmt.Sprintf("sst_%d.db", i)
+						value, exists = searchSSTable(filename, key)
+						if exists {
+							break
+						}
+					}
+				}
+				if exists && value != "<TOMBSTONE>" {
 					response = value
 				} else {
 					response = "Key Don't Exist"
@@ -133,17 +165,20 @@ func handleConnection(conn net.Conn) {
 				if err == nil {
 					mu.Lock()
 
-					_, exists := kvStore[key]
-					if exists {
-						response = "Successful Deletion"
-						fmt.Printf("Deleted from memory: %s -[%s]\n", key, kvStore[key])
-						delete(kvStore, key)
-					} else {
-						response = "Key Don't Exist"
-						fmt.Printf("Key : %s Don't exist in memory", key)
-					}
+					activeMem.Put(key, "<TOMBSTONE>")
+					if activeMem.size >= MemTableLimit {
+						immutMem = activeMem
+						activeMem = NewSkipList()
 
+						select {
+						case flushChan <- immutMem:
+							fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
+						default:
+							fmt.Println("\n[WARNING] SSD is too slow! Background flusher is falling behind.")
+						}
+					}
 					mu.Unlock()
+					response = "OK"
 				} else {
 					response = "ERROR: disk sync failed"
 				}
@@ -188,16 +223,36 @@ func loadWAL() {
 		if command == "SET" && len(parts) >= 3 {
 			key := parts[1]
 			value := strings.Join(parts[2:], " ")
-			kvStore[key] = value
+			activeMem.Put(key, value)
 		} else if command == "DEL" && len(parts) == 2 {
-			delete(kvStore, parts[1])
+			key := parts[1]
+			activeMem.Put(key, "<TOMBSTONE>")
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		panic(fmt.Sprintf("Failed to read file: %v\n", err))
 	}
 
-	fmt.Printf("Startup: Loaded %d keys from WAL into memory\n", len(kvStore))
+	fmt.Printf("Startup: WAL loaded successfully. MemTable is consuming %d bytes of RAM\n", activeMem.size)
+}
+
+func backgroundFlusher() {
+	for memTOFlush := range flushChan {
+		err := flushMemTable(memTOFlush, sstCounter)
+		if err != nil {
+			fmt.Printf("[FATAL] Failed to flush SSTable: %v\n", err)
+			continue
+		}
+		sstCounter++
+		mu.Lock()
+		immutMem = nil
+		mu.Unlock()
+
+		err = os.Truncate("wal.log", 0)
+		if err == nil {
+			fmt.Println("[SYSTEM] WAL truncated successfully.")
+		}
+	}
 }
 
 func main() {
@@ -253,6 +308,7 @@ func main() {
 
 	}()
 
+	go backgroundFlusher()
 	// 5. Start the listener on port 8080
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
