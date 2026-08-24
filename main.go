@@ -31,6 +31,8 @@ var (
 )
 
 func handleConnection(conn net.Conn) {
+	const MaxPayloadSize = 1 * 1024 * 1024 // 1 MB hard limit
+
 	defer conn.Close()
 	fmt.Printf("New client connected: %s\n", conn.RemoteAddr().String())
 
@@ -40,12 +42,17 @@ func handleConnection(conn net.Conn) {
 		// 2. Read exactly 4 bytes from the network stream
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
-			//fmt.Printf("Client disconnected or read error: %v\n", err)
+			fmt.Printf("Client disconnected or read error: %v\n", err)
 			return // Kill the goroutine if the client drops
 		}
 		// 3. Translate those raw bytes into an actual integer
 		msgLength := binary.BigEndian.Uint32(header)
-		//fmt.Printf("Incoming message length: %d bytes \n", msgLength)
+		if msgLength > MaxPayloadSize {
+			fmt.Printf("[SECURITY] Payload too large: %d bytes. Dropping connection.\n", msgLength)
+			return
+		}
+
+		fmt.Printf("Incoming message length: %d bytes \n", msgLength)
 
 		// Create a new buffer dynamically sized to the exact length of the payload
 		payload := make([]byte, msgLength)
@@ -53,12 +60,12 @@ func handleConnection(conn net.Conn) {
 		// Block and read exactly that many bytes from the socket
 		_, err = io.ReadFull(conn, payload)
 		if err != nil {
-			//fmt.Printf("Failed to read payload: %v\n", err)
+			fmt.Printf("Failed to read payload: %v\n", err)
 			return
 		}
 
 		// Print the actual command
-		//fmt.Printf("Received command: %s\n", string(payload))
+		fmt.Printf("Received command: %s\n", string(payload))
 
 		// Parsing the payload
 		cleanPayload := strings.TrimSpace(string(payload))
@@ -277,8 +284,36 @@ func backgroundFlusher() {
 	}
 }
 
+func initSSTCounter() {
+	files, err := os.ReadDir(".")
+	if err != nil {
+		return
+	}
+
+	maxID := -1
+	for _, file := range files {
+		name := file.Name()
+		var id int
+
+		if strings.HasPrefix(name, "sst_") && strings.HasSuffix(name, ".db") {
+			_, err := fmt.Sscanf(name, "sst_%d.db", &id)
+			if err == nil && id > maxID {
+				maxID = id
+			}
+		}
+	}
+
+	if maxID >= 0 {
+		mu.Lock()
+		sstCounter = maxID + 1
+		mu.Unlock()
+		fmt.Printf("Startup: Discovered existing SSTables. sstCounter set to %d\n", sstCounter)
+	}
+}
+
 func main() {
 	// 1. Rebuilding memory from disk BEFORE starting the server
+	initSSTCounter()
 	loadWAL()
 
 	// 2. Open the WAL for appending new commands

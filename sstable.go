@@ -208,7 +208,7 @@ func CompactSSTables(fileIDs []int, outputFileID int) error {
 		oldFilename := fmt.Sprintf("sst_%d.db", id)
 		err := os.Remove(oldFilename)
 		if err != nil {
-			fmt.Printf("[WARNING] Failed to delete ibsolete files %s: %v\n", oldFilename, err)
+			fmt.Printf("[WARNING] Failed to delete obsolete files %s: %v\n", oldFilename, err)
 		}
 	}
 	outFile.Sync()
