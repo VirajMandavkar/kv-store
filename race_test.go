@@ -12,7 +12,9 @@ func TestSSTCounterRace(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 1000; i++ {
+			mu.Lock()
 			sstCounter++
+			mu.Unlock()
 		}
 	}()
 
