@@ -1,0 +1,32 @@
+name : KV-Store CORE Engine CI
+
+on: 
+  push:
+    branches: ["main", "feat/*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test-and-build:
+    name: Build & Analyze
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Go Environment
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Compile Engine
+      run: go build -v ./...
+    
+    - name: Static Code Analysis
+      run: go vet ./...
+
+    - name: Detect Data Races
+      run: go test -race -v ./...
+
+      
