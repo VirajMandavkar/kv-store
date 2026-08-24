@@ -14,6 +14,9 @@ import (
 )
 
 type walRequest struct {
+	command string
+	key     string
+	value   string
 	logLine string
 	receipt chan error
 }
@@ -88,6 +91,9 @@ func handleConnection(conn net.Conn) {
 				rec := make(chan error, 1)
 
 				walReq := walRequest{
+					command: "SET",
+					key:     key,
+					value:   value,
 					logLine: logLine,
 					receipt: rec,
 				}
@@ -96,21 +102,8 @@ func handleConnection(conn net.Conn) {
 				err := <-rec
 
 				if err == nil {
-					var tableToFlush *SkipList
-					mu.Lock()
-					activeMem.Put(key, value)
-					if activeMem.size >= MemTableLimit {
-						tableToFlush = activeMem
-						immutMem = activeMem
-						activeMem = NewSkipList()
-					}
-					mu.Unlock()
-					if tableToFlush != nil {
-						flushChan <- tableToFlush
-						fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
-					}
 					response = "OK"
-					//fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
+					fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
 				} else {
 					response = "ERROR: disk sync failed"
 				}
@@ -163,6 +156,8 @@ func handleConnection(conn net.Conn) {
 				rec := make(chan error, 1)
 
 				walReq := walRequest{
+					command: "SET",
+					key:     key,
 					logLine: logLine,
 					receipt: rec,
 				}
@@ -170,21 +165,6 @@ func handleConnection(conn net.Conn) {
 				walChan <- walReq
 				err := <-rec
 				if err == nil {
-					var tableToFlush *SkipList
-					mu.Lock()
-
-					activeMem.Put(key, "<TOMBSTONE>")
-					if activeMem.size >= MemTableLimit {
-						tableToFlush = activeMem
-						immutMem = activeMem
-						activeMem = NewSkipList()
-					}
-					mu.Unlock()
-
-					if tableToFlush != nil {
-						flushChan <- tableToFlush
-						fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
-					}
 					response = "OK"
 				} else {
 					response = "ERROR: disk sync failed"
@@ -352,10 +332,36 @@ func main() {
 					break drainLoop
 				}
 			}
+
 			for _, r := range batch {
 				walFile.WriteString(r.logLine)
 			}
 			syncErr := walFile.Sync()
+
+			if syncErr == nil {
+				var tablesToFlush []*SkipList
+
+				mu.Lock()
+				for _, r := range batch {
+					if r.command == "SET" {
+						activeMem.Put(r.key, r.value)
+					} else if r.command == "DEL" {
+						activeMem.Put(r.key, "<TOMBSTONE>")
+					}
+
+					if activeMem.size >= MemTableLimit {
+						tablesToFlush = append(tablesToFlush, activeMem)
+						immutMem = activeMem
+						activeMem = NewSkipList()
+					}
+				}
+				mu.Unlock()
+
+				for _, t := range tablesToFlush {
+					flushChan <- t
+					fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
+				}
+			}
 
 			for _, r := range batch {
 				r.receipt <- syncErr
