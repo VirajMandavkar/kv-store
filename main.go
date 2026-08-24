@@ -89,19 +89,19 @@ func handleConnection(conn net.Conn) {
 				err := <-rec
 
 				if err == nil {
+					var tableToFlush *SkipList
 					mu.Lock()
 					activeMem.Put(key, value)
 					if activeMem.size >= MemTableLimit {
+						tableToFlush = activeMem
 						immutMem = activeMem
 						activeMem = NewSkipList()
-						select {
-						case flushChan <- immutMem:
-							fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
-						default:
-							fmt.Println("\n[WARNING] SSD is too slow! Background flusher is falling behind.")
-						}
 					}
 					mu.Unlock()
+					if tableToFlush != nil {
+						flushChan <- tableToFlush
+						fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
+					}
 					response = "OK"
 					//fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
 				} else {
@@ -163,21 +163,21 @@ func handleConnection(conn net.Conn) {
 				walChan <- walReq
 				err := <-rec
 				if err == nil {
+					var tableToFlush *SkipList
 					mu.Lock()
 
 					activeMem.Put(key, "<TOMBSTONE>")
 					if activeMem.size >= MemTableLimit {
+						tableToFlush = activeMem
 						immutMem = activeMem
 						activeMem = NewSkipList()
-
-						select {
-						case flushChan <- immutMem:
-							fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
-						default:
-							fmt.Println("\n[WARNING] SSD is too slow! Background flusher is falling behind.")
-						}
 					}
 					mu.Unlock()
+
+					if tableToFlush != nil {
+						flushChan <- tableToFlush
+						fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
+					}
 					response = "OK"
 				} else {
 					response = "ERROR: disk sync failed"
@@ -237,21 +237,34 @@ func loadWAL() {
 }
 
 func backgroundFlusher() {
+	var uncompactedFiles []int
 	for memTOFlush := range flushChan {
 		err := flushMemTable(memTOFlush, sstCounter)
 		if err != nil {
 			fmt.Printf("[FATAL] Failed to flush SSTable: %v\n", err)
 			continue
 		}
+
+		uncompactedFiles = append(uncompactedFiles, sstCounter)
 		sstCounter++
+
+		if len(uncompactedFiles) >= 4 {
+			fmt.Println("\n[SYSTEM] Compaction threshold reached. Initiating K-Way Merge...")
+
+			newCompactedID := sstCounter
+			sstCounter++
+
+			err := CompactSSTables(uncompactedFiles, newCompactedID)
+			if err != nil {
+				fmt.Printf("[ERROR] Compaction failed: %v\n", err)
+			} else {
+				uncompactedFiles = []int{newCompactedID}
+			}
+		}
+
 		mu.Lock()
 		immutMem = nil
 		mu.Unlock()
-
-		err = os.Truncate("wal.log", 0)
-		if err == nil {
-			fmt.Println("[SYSTEM] WAL truncated successfully.")
-		}
 	}
 }
 
