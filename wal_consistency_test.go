@@ -13,10 +13,6 @@ import (
 )
 
 func TestSplitBrainConsistency(t *testing.T) {
-	os.Remove("wal.log")
-
-	go main()
-	time.Sleep(1 * time.Second)
 
 	var wg sync.WaitGroup
 	key := "split_brain_key"

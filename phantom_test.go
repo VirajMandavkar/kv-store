@@ -5,16 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"testing"
-	"time"
 )
 
 func TestPhantomMemTableVisibility(t *testing.T) {
-	os.Remove("wal.log")
-
-	go main()
-	time.Sleep(1 * time.Second)
 
 	conn, err := net.Dial("tcp", "127.0.0.1:8080")
 	if err != nil {
