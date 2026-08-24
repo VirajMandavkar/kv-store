@@ -239,20 +239,29 @@ func loadWAL() {
 func backgroundFlusher() {
 	var uncompactedFiles []int
 	for memTOFlush := range flushChan {
-		err := flushMemTable(memTOFlush, sstCounter)
+
+		mu.RLock()
+		currentID := sstCounter
+		mu.RUnlock()
+
+		err := flushMemTable(memTOFlush, currentID)
 		if err != nil {
 			fmt.Printf("[FATAL] Failed to flush SSTable: %v\n", err)
 			continue
 		}
 
 		uncompactedFiles = append(uncompactedFiles, sstCounter)
+		mu.Lock()
 		sstCounter++
+		mu.Unlock()
 
 		if len(uncompactedFiles) >= 4 {
 			fmt.Println("\n[SYSTEM] Compaction threshold reached. Initiating K-Way Merge...")
 
+			mu.Lock()
 			newCompactedID := sstCounter
 			sstCounter++
+			mu.Unlock()
 
 			err := CompactSSTables(uncompactedFiles, newCompactedID)
 			if err != nil {
