@@ -25,7 +25,7 @@ const MemTableLimit = 100 * 1024 // 1 MB limit
 
 var (
 	activeMem  = NewSkipList()
-	immutMem   *SkipList
+	immutMem   []*SkipList
 	mu         sync.RWMutex
 	walFile    *os.File
 	walChan    = make(chan walRequest, 10000)
@@ -120,8 +120,13 @@ func handleConnection(conn net.Conn) {
 				mu.RLock()
 				value, exists = activeMem.Get(key)
 
-				if !exists && immutMem != nil {
-					value, exists = immutMem.Get(key)
+				if !exists {
+					for i := len(immutMem) - 1; i >= 0; i-- {
+						value, exists = immutMem[i].Get(key)
+						if exists {
+							break
+						}
+					}
 				}
 				mu.RUnlock()
 
@@ -259,7 +264,9 @@ func backgroundFlusher() {
 		}
 
 		mu.Lock()
-		immutMem = nil
+		if len(immutMem) > 0 {
+			immutMem = immutMem[1:] // Pop the oldest table from the front
+		}
 		mu.Unlock()
 	}
 }
@@ -351,7 +358,7 @@ func main() {
 
 					if activeMem.size >= MemTableLimit {
 						tablesToFlush = append(tablesToFlush, activeMem)
-						immutMem = activeMem
+						immutMem = append(immutMem, activeMem)
 						activeMem = NewSkipList()
 					}
 				}
