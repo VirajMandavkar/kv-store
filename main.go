@@ -1,3 +1,4 @@
+// Package main contains the TCP server and its in-memory and on-disk storage layers.
 package main
 
 import (
@@ -13,6 +14,8 @@ import (
 	"syscall"
 )
 
+// walRequest is one client mutation waiting for durable WAL persistence.
+// receipt lets the WAL worker report the sync result to the requesting connection.
 type walRequest struct {
 	command string
 	key     string
@@ -21,34 +24,48 @@ type walRequest struct {
 	receipt chan error
 }
 
+// MemTableLimit is the approximate byte threshold that rotates the active MemTable.
 const MemTableLimit = 100 * 1024 // 1 MB limit
 
 var (
-	activeMem  = NewSkipList()
-	immutMem   []*SkipList
-	mu         sync.RWMutex
-	walFile    *os.File
-	walChan    = make(chan walRequest, 10000)
-	flushChan  = make(chan *SkipList, 1)
+	// activeMem accepts new writes after the WAL worker has synced them.
+	activeMem = NewSkipList()
+	// immutMem holds rotated tables until the background flusher persists them.
+	immutMem []*SkipList
+	// mu protects all shared memory state and the SSTable ID counter.
+	mu sync.RWMutex
+	// walFile is the append-only write-ahead log shared by the WAL worker.
+	walFile *os.File
+	// walChan serializes mutations and allows the worker to batch disk writes.
+	walChan = make(chan walRequest, 10000)
+	// flushChan transfers full immutable tables to the SSTable writer.
+	flushChan = make(chan *SkipList, 1)
+	// sstCounter supplies the next SSTable filename suffix.
 	sstCounter = 0
+
+	// These wait groups make shutdown wait for active connections and WAL work.
+	connWg sync.WaitGroup
+	walWg  sync.WaitGroup
 )
 
+// handleConnection serves framed commands until the client disconnects.
+// Each request starts with a four-byte big-endian payload length.
 func handleConnection(conn net.Conn) {
 	const MaxPayloadSize = 1 * 1024 * 1024 // 1 MB hard limit
 
 	defer conn.Close()
 	fmt.Printf("New client connected: %s\n", conn.RemoteAddr().String())
 
-	for { // 1. Create a 4-byte buffer for the header
+	for { // Read and process one length-prefixed request at a time.
 		header := make([]byte, 4)
 
-		// 2. Read exactly 4 bytes from the network stream
+		// TCP is a stream, so ReadFull is required to obtain the whole header.
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
 			fmt.Printf("Client disconnected or read error: %v\n", err)
 			return // Kill the goroutine if the client drops
 		}
-		// 3. Translate those raw bytes into an actual integer
+		// Decode the network-order length before allocating the payload buffer.
 		msgLength := binary.BigEndian.Uint32(header)
 		if msgLength > MaxPayloadSize {
 			fmt.Printf("[SECURITY] Payload too large: %d bytes. Dropping connection.\n", msgLength)
@@ -70,7 +87,7 @@ func handleConnection(conn net.Conn) {
 		// Print the actual command
 		fmt.Printf("Received command: %s\n", string(payload))
 
-		// Parsing the payload
+		// Commands are ASCII-like text; the first token selects the operation.
 		cleanPayload := strings.TrimSpace(string(payload))
 		parts := strings.Split(string(cleanPayload), " ")
 
@@ -83,6 +100,7 @@ func handleConnection(conn net.Conn) {
 
 		switch command {
 		case "SET":
+			// Values may contain spaces, so everything after the key is retained.
 			if len(parts) >= 3 {
 				key := parts[1]
 				value := strings.Join(parts[2:], " ")
@@ -98,6 +116,7 @@ func handleConnection(conn net.Conn) {
 					receipt: rec,
 				}
 
+				// The response is delayed until the WAL worker confirms Sync succeeded.
 				walChan <- walReq
 				err := <-rec
 
@@ -112,6 +131,7 @@ func handleConnection(conn net.Conn) {
 			}
 
 		case "GET":
+			// Newer memory layers shadow older ones, so search in newest-first order.
 			if len(parts) == 2 {
 				key := parts[1]
 				var value string
@@ -120,6 +140,7 @@ func handleConnection(conn net.Conn) {
 				mu.RLock()
 				value, exists = activeMem.Get(key)
 
+				// Immutable tables are checked before disk because they are newer than SSTables.
 				if !exists {
 					for i := len(immutMem) - 1; i >= 0; i-- {
 						value, exists = immutMem[i].Get(key)
@@ -130,6 +151,7 @@ func handleConnection(conn net.Conn) {
 				}
 				mu.RUnlock()
 
+				// SSTables are also searched newest-first to preserve last-write-wins behavior.
 				if !exists {
 					mu.RLock()
 					maxFiles := sstCounter
@@ -154,6 +176,7 @@ func handleConnection(conn net.Conn) {
 			}
 
 		case "DEL":
+			// Deletes are represented by a tombstone so older values remain hidden.
 			if len(parts) == 2 {
 				key := parts[1]
 
@@ -167,6 +190,7 @@ func handleConnection(conn net.Conn) {
 					receipt: rec,
 				}
 
+				// The WAL record is durable before the client receives success.
 				walChan <- walReq
 				err := <-rec
 				if err == nil {
@@ -183,6 +207,7 @@ func handleConnection(conn net.Conn) {
 			response = "ERROR: unknown command"
 		}
 
+		// Responses use the same four-byte length-prefix framing as requests.
 		respBytes := []byte(response)
 		respHeader := make([]byte, 4)
 		binary.BigEndian.PutUint32(respHeader, uint32(len(respBytes)))
@@ -192,6 +217,7 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
+// loadWAL replays durable mutations into the active MemTable during startup.
 func loadWAL() {
 	file, err := os.Open("wal.log")
 	if err != nil {
@@ -204,6 +230,7 @@ func loadWAL() {
 
 	scanner := bufio.NewScanner(file)
 
+	// WAL entries are newline-delimited SET and DEL commands.
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Split(line, " ")
@@ -228,6 +255,7 @@ func loadWAL() {
 	fmt.Printf("Startup: WAL loaded successfully. MemTable is consuming %d bytes of RAM\n", activeMem.size)
 }
 
+// backgroundFlusher persists rotated MemTables and periodically compacts SSTables.
 func backgroundFlusher() {
 	var uncompactedFiles []int
 	for memTOFlush := range flushChan {
@@ -247,6 +275,7 @@ func backgroundFlusher() {
 		sstCounter++
 		mu.Unlock()
 
+		// Four flushed files trigger a k-way merge to reduce lookup work.
 		if len(uncompactedFiles) >= 4 {
 			fmt.Println("\n[SYSTEM] Compaction threshold reached. Initiating K-Way Merge...")
 
@@ -271,6 +300,7 @@ func backgroundFlusher() {
 	}
 }
 
+// initSSTCounter scans existing SSTable names so a restart does not reuse an ID.
 func initSSTCounter() {
 	files, err := os.ReadDir(".")
 	if err != nil {
@@ -298,53 +328,86 @@ func initSSTCounter() {
 	}
 }
 
+// main performs recovery, starts background workers, and accepts TCP clients.
 func main() {
-	// 1. Rebuilding memory from disk BEFORE starting the server
+	// Recover file metadata and the WAL before accepting client requests.
 	initSSTCounter()
 	loadWAL()
 
-	// 2. Open the WAL for appending new commands
+	// Open the WAL in append mode so new records follow existing durable records.
 	var err error
 	walFile, err = os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		fmt.Printf("Fatal: failed to open WAL: %v\n", err)
 		os.Exit(1)
 	}
-	defer walFile.Close()
 
-	// 3. SetUp Graceful shutdown trap
+	ln, err := net.Listen("tcp", ":8080")
+	if err != nil {
+		fmt.Printf("Failed to bind to prt: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("KV Store TCP server listening on :8080")
+
+	// Shutdown closes the listener first, then drains connections and WAL work.
 	sigChan := make(chan os.Signal, 1)
+
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
 		fmt.Println("\n Recieived shutdown signal . Flushing WAL and exiting ..")
+		ln.Close()
+
+		connWg.Wait()
+		close(walChan)
+
+		walWg.Wait()
+		walFile.Sync()
 		walFile.Close()
+
+		fmt.Println("[SYSTEM] Data safely persisted to WAL. Shutdown complete.")
 		os.Exit(0)
 	}()
 
-	// 4. background WAL flusher
+	// The single WAL worker preserves mutation order while batching fsyncs.
 
+	walWg.Add(1)
 	go func() {
+		defer walWg.Done()
 		var batch []walRequest
 
 		for {
-			req := <-walChan
+			req, ok := <-walChan
+			if !ok {
+				if len(batch) > 0 {
+					for _, r := range batch {
+						walFile.WriteString(r.logLine)
+					}
+					walFile.Sync()
+				}
+				return
+			}
 			batch = append(batch, req)
 		drainLoop:
 			for len(batch) < 100 {
 				select {
-				case nextReq := <-walChan:
+				case nextReq, ok := <-walChan:
+					if !ok {
+						break drainLoop // Channel closed while draining
+					}
 					batch = append(batch, nextReq)
 				default:
 					break drainLoop
 				}
 			}
 
+			// Write the whole batch before syncing once for the group.
 			for _, r := range batch {
 				walFile.WriteString(r.logLine)
 			}
 			syncErr := walFile.Sync()
 
+			// Only expose mutations to readers after the corresponding WAL sync succeeds.
 			if syncErr == nil {
 				var tablesToFlush []*SkipList
 
@@ -364,6 +427,7 @@ func main() {
 				}
 				mu.Unlock()
 
+				// Flushing happens asynchronously after the active table has been replaced.
 				for _, t := range tablesToFlush {
 					flushChan <- t
 					fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
@@ -379,24 +443,20 @@ func main() {
 	}()
 
 	go backgroundFlusher()
-	// 5. Start the listener on port 8080
-	ln, err := net.Listen("tcp", ":8080")
-	if err != nil {
-		fmt.Printf("Failed to bind to prt: %v\n", err)
-		os.Exit(1)
-	}
-	defer ln.Close()
-
-	fmt.Println("KV Store TCP server listening on :8080")
-
-	//6.The infinite Accept Loop
+	// Accept connections on the fixed service port until shutdown closes the listener.
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Printf("Failed to accept connection: %v\n", err)
-			continue
+			// When ln.Close() is called by the shutdown trap, Accept() returns an error.
+			// We break the loop gracefully instead of printing a failure.
+			break
 		}
-		go handleConnection(conn)
+
+		connWg.Add(1) // Register the new connection
+		go func(c net.Conn) {
+			defer connWg.Done() // Unregister when the connection closes
+			handleConnection(c)
+		}(conn)
 	}
 }
