@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 )
 
+// walRequest carries data from the connection handler to the centralized WAL worker
 type walRequest struct {
 	command string
 	key     string
@@ -21,19 +23,20 @@ type walRequest struct {
 	receipt chan error
 }
 
-const MemTableLimit = 100 * 1024 // 1 MB limit
+const MemTableLimit = 100 * 1024 // 100 KB limit for rapid flushing
 
 var (
 	activeMem  = NewSkipList()
-	immutMem   []*SkipList
+	immutMem   []*SkipList // Queue of frozen tables waiting for disk I/O
 	mu         sync.RWMutex
 	walFile    *os.File
 	walChan    = make(chan walRequest, 10000)
 	flushChan  = make(chan *SkipList, 1)
 	sstCounter = 0
 
-	connWg sync.WaitGroup
-	walWg  sync.WaitGroup
+	// Orchestration Mechanics
+	connWg sync.WaitGroup // Tracks active client connections
+	walWg  sync.WaitGroup // Tracks the background WAL flusher
 )
 
 func handleConnection(conn net.Conn) {
@@ -42,41 +45,30 @@ func handleConnection(conn net.Conn) {
 	defer conn.Close()
 	fmt.Printf("New client connected: %s\n", conn.RemoteAddr().String())
 
-	for { // 1. Create a 4-byte buffer for the header
+	for {
+		// 1. Read the 4-byte length header
 		header := make([]byte, 4)
-
-		// 2. Read exactly 4 bytes from the network stream
 		_, err := io.ReadFull(conn, header)
 		if err != nil {
-			fmt.Printf("Client disconnected or read error: %v\n", err)
-			return // Kill the goroutine if the client drops
+			return // Client disconnected naturally
 		}
-		// 3. Translate those raw bytes into an actual integer
+
 		msgLength := binary.BigEndian.Uint32(header)
 		if msgLength > MaxPayloadSize {
 			fmt.Printf("[SECURITY] Payload too large: %d bytes. Dropping connection.\n", msgLength)
 			return
 		}
 
-		fmt.Printf("Incoming message length: %d bytes \n", msgLength)
-
-		// Create a new buffer dynamically sized to the exact length of the payload
+		// 2. Read the exact payload
 		payload := make([]byte, msgLength)
-
-		// Block and read exactly that many bytes from the socket
 		_, err = io.ReadFull(conn, payload)
 		if err != nil {
-			fmt.Printf("Failed to read payload: %v\n", err)
 			return
 		}
 
-		// Print the actual command
-		fmt.Printf("Received command: %s\n", string(payload))
-
-		// Parsing the payload
+		// 3. Parse Command
 		cleanPayload := strings.TrimSpace(string(payload))
 		parts := strings.Split(string(cleanPayload), " ")
-
 		if len(parts) == 0 {
 			continue
 		}
@@ -89,7 +81,6 @@ func handleConnection(conn net.Conn) {
 			if len(parts) >= 3 {
 				key := parts[1]
 				value := strings.Join(parts[2:], " ")
-
 				logLine := fmt.Sprintf("SET %s %s\n", key, value)
 				rec := make(chan error, 1)
 
@@ -102,11 +93,10 @@ func handleConnection(conn net.Conn) {
 				}
 
 				walChan <- walReq
-				err := <-rec
+				err := <-rec // Block until the WAL worker syncs to disk
 
 				if err == nil {
 					response = "OK"
-					fmt.Printf("Saved to memory: [%s] = %s\n", key, value)
 				} else {
 					response = "ERROR: disk sync failed"
 				}
@@ -120,9 +110,11 @@ func handleConnection(conn net.Conn) {
 				var value string
 				var exists bool
 
+				// Check active RAM
 				mu.RLock()
 				value, exists = activeMem.Get(key)
 
+				// Check queued frozen RAM (search backwards for most recent)
 				if !exists {
 					for i := len(immutMem) - 1; i >= 0; i-- {
 						value, exists = immutMem[i].Get(key)
@@ -133,6 +125,7 @@ func handleConnection(conn net.Conn) {
 				}
 				mu.RUnlock()
 
+				// Check Disk (SSTables)
 				if !exists {
 					mu.RLock()
 					maxFiles := sstCounter
@@ -146,11 +139,12 @@ func handleConnection(conn net.Conn) {
 						}
 					}
 				}
+
+				// Resolve Tombstones
 				if exists && value != "<TOMBSTONE>" {
 					response = value
 				} else {
 					response = "Key Don't Exist"
-					fmt.Printf("Key : %s Don't exist in memory\n", key)
 				}
 			} else {
 				response = "ERROR : syntax"
@@ -159,12 +153,11 @@ func handleConnection(conn net.Conn) {
 		case "DEL":
 			if len(parts) == 2 {
 				key := parts[1]
-
 				logLine := fmt.Sprintf("DEL %s\n", key)
 				rec := make(chan error, 1)
 
 				walReq := walRequest{
-					command: "SET",
+					command: "DEL",
 					key:     key,
 					logLine: logLine,
 					receipt: rec,
@@ -177,15 +170,15 @@ func handleConnection(conn net.Conn) {
 				} else {
 					response = "ERROR: disk sync failed"
 				}
-
 			} else {
-				response = "ERROR: Synyax"
+				response = "ERROR: Syntax"
 			}
 
 		default:
 			response = "ERROR: unknown command"
 		}
 
+		// 4. Send Response
 		respBytes := []byte(response)
 		respHeader := make([]byte, 4)
 		binary.BigEndian.PutUint32(respHeader, uint32(len(respBytes)))
@@ -206,7 +199,6 @@ func loadWAL() {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
-
 	for scanner.Scan() {
 		line := scanner.Text()
 		parts := strings.Split(line, " ")
@@ -227,14 +219,12 @@ func loadWAL() {
 	if err := scanner.Err(); err != nil {
 		panic(fmt.Sprintf("Failed to read file: %v\n", err))
 	}
-
-	fmt.Printf("Startup: WAL loaded successfully. MemTable is consuming %d bytes of RAM\n", activeMem.size)
+	fmt.Printf("Startup: WAL loaded. MemTable consuming %d bytes\n", activeMem.size)
 }
 
 func backgroundFlusher() {
 	var uncompactedFiles []int
 	for memTOFlush := range flushChan {
-
 		mu.RLock()
 		currentID := sstCounter
 		mu.RUnlock()
@@ -246,13 +236,13 @@ func backgroundFlusher() {
 		}
 
 		uncompactedFiles = append(uncompactedFiles, sstCounter)
+
 		mu.Lock()
 		sstCounter++
 		mu.Unlock()
 
 		if len(uncompactedFiles) >= 4 {
 			fmt.Println("\n[SYSTEM] Compaction threshold reached. Initiating K-Way Merge...")
-
 			mu.Lock()
 			newCompactedID := sstCounter
 			sstCounter++
@@ -266,9 +256,10 @@ func backgroundFlusher() {
 			}
 		}
 
+		// Pop the oldest frozen table off the queue since it's now on disk
 		mu.Lock()
 		if len(immutMem) > 0 {
-			immutMem = immutMem[1:] // Pop the oldest table from the front
+			immutMem = immutMem[1:]
 		}
 		mu.Unlock()
 	}
@@ -279,12 +270,10 @@ func initSSTCounter() {
 	if err != nil {
 		return
 	}
-
 	maxID := -1
 	for _, file := range files {
 		name := file.Name()
 		var id int
-
 		if strings.HasPrefix(name, "sst_") && strings.HasSuffix(name, ".db") {
 			_, err := fmt.Sscanf(name, "sst_%d.db", &id)
 			if err == nil && id > maxID {
@@ -292,7 +281,6 @@ func initSSTCounter() {
 			}
 		}
 	}
-
 	if maxID >= 0 {
 		mu.Lock()
 		sstCounter = maxID + 1
@@ -301,48 +289,44 @@ func initSSTCounter() {
 	}
 }
 
-func main() {
-	// 1. Rebuilding memory from disk BEFORE starting the server
+// StartServer owns the entire lifecycle of the KV Store.
+// It returns an error if startup fails, and blocks until graceful shutdown completes.
+func StartServer(ctx context.Context) error {
+	// ==========================================
+	// PHASE 1: RECOVERY & INITIALIZATION
+	// ==========================================
 	initSSTCounter()
 	loadWAL()
 
-	// 2. Open the WAL for appending new commands
 	var err error
 	walFile, err = os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		fmt.Printf("Fatal: failed to open WAL: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to open WAL: %v", err)
 	}
 
 	ln, err := net.Listen("tcp", ":8080")
 	if err != nil {
-		fmt.Printf("Failed to bind to prt: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to bind to port: %v", err)
 	}
 	fmt.Println("KV Store TCP server listening on :8080")
 
-	// 3. SetUp Graceful shutdown trap
-	sigChan := make(chan os.Signal, 1)
+	// ==========================================
+	// PHASE 2: BACKGROUND WORKER DEPLOYMENT
+	// ==========================================
 
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	// 2A. The Asynchronous Closer
+	// Waits in the background for a stop signal, then forces the network to close.
 	go func() {
-		<-sigChan
-		fmt.Println("\n Recieived shutdown signal . Flushing WAL and exiting ..")
-		ln.Close()
-
-		connWg.Wait()
-		close(walChan)
-
-		walWg.Wait()
-		walFile.Sync()
-		walFile.Close()
-
-		fmt.Println("[SYSTEM] Data safely persisted to WAL. Shutdown complete.")
-		os.Exit(0)
+		<-ctx.Done()
+		fmt.Println("\n[SERVER] Shutdown signal received. Breaking network listener...")
+		_ = ln.Close()
 	}()
 
-	// 4. background WAL flusher
+	// 2B. The SSTable Disk Flusher
+	go backgroundFlusher()
 
+	// 2C. The WAL Worker
+	// Must be started BEFORE the network accept loop so clients have someone to talk to.
 	walWg.Add(1)
 	go func() {
 		defer walWg.Done()
@@ -351,6 +335,7 @@ func main() {
 		for {
 			req, ok := <-walChan
 			if !ok {
+				// Channel closed by shutdown trap. Flush final batch.
 				if len(batch) > 0 {
 					for _, r := range batch {
 						walFile.WriteString(r.logLine)
@@ -360,12 +345,13 @@ func main() {
 				return
 			}
 			batch = append(batch, req)
+
 		drainLoop:
 			for len(batch) < 100 {
 				select {
 				case nextReq, ok := <-walChan:
 					if !ok {
-						break drainLoop // Channel closed while draining
+						break drainLoop
 					}
 					batch = append(batch, nextReq)
 				default:
@@ -373,17 +359,17 @@ func main() {
 				}
 			}
 
+			// Sync to disk
 			for _, r := range batch {
 				walFile.WriteString(r.logLine)
 			}
 			syncErr := walFile.Sync()
 
+			// Apply to memory
 			if syncErr == nil {
 				var tablesToFlush []*SkipList
-
 				mu.Lock()
 				for _, r := range batch {
-
 					switch r.command {
 					case "SET":
 						activeMem.Put(r.key, r.value)
@@ -401,7 +387,6 @@ func main() {
 
 				for _, t := range tablesToFlush {
 					flushChan <- t
-					fmt.Println("\n[SYSTEM] MemTable frozen! Sent to background flusher.")
 				}
 			}
 
@@ -410,24 +395,59 @@ func main() {
 			}
 			batch = batch[:0]
 		}
-
 	}()
 
-	go backgroundFlusher()
-	// 5. Start the listener on port 8080
-
+	// ==========================================
+	// PHASE 3: THE MAIN EVENT LOOP
+	// ==========================================
+	// Blocks here processing clients until ln.Close() is called by the async closer.
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// When ln.Close() is called by the shutdown trap, Accept() returns an error.
-			// We break the loop gracefully instead of printing a failure.
-			break
+			break // The async closer shut down the listener.
 		}
 
-		connWg.Add(1) // Register the new connection
+		connWg.Add(1)
 		go func(c net.Conn) {
-			defer connWg.Done() // Unregister when the connection closes
+			defer connWg.Done()
 			handleConnection(c)
 		}(conn)
 	}
+
+	// ==========================================
+	// PHASE 4: THE GRACEFUL SHUTDOWN CHAIN
+	// ==========================================
+	// The accept loop broke. We now carefully wind down the system.
+
+	fmt.Println("[SHUTDOWN] 1. Waiting for active client connections to finish...")
+	connWg.Wait()
+
+	fmt.Println("[SHUTDOWN] 2. Closing WAL channel to signal worker...")
+	close(walChan)
+
+	fmt.Println("[SHUTDOWN] 3. Waiting for WAL worker to commit final bytes...")
+	walWg.Wait()
+
+	fmt.Println("[SHUTDOWN] 4. Synchronizing and closing file descriptor...")
+	if err := walFile.Sync(); err != nil {
+		fmt.Printf("[ERROR] Failed syncing WAL: %v\n", err)
+	}
+	walFile.Close()
+
+	fmt.Println("[SYSTEM] Data safely persisted. Shutdown complete.")
+	return nil
+}
+
+// main now strictly handles OS interaction and context management
+func main() {
+	// Create a context that automatically cancels on SIGINT or SIGTERM
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if err := StartServer(ctx); err != nil {
+		fmt.Printf("[FATAL] Server failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Process terminated cleanly.")
 }
