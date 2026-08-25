@@ -291,7 +291,7 @@ func initSSTCounter() {
 
 // StartServer owns the entire lifecycle of the KV Store.
 // It returns an error if startup fails, and blocks until graceful shutdown completes.
-func StartServer(ctx context.Context) error {
+func StartServer(ctx context.Context, addr string) error {
 	// ==========================================
 	// PHASE 1: RECOVERY & INITIALIZATION
 	// ==========================================
@@ -304,11 +304,11 @@ func StartServer(ctx context.Context) error {
 		return fmt.Errorf("failed to open WAL: %v", err)
 	}
 
-	ln, err := net.Listen("tcp", ":8080")
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("failed to bind to port: %v", err)
+		return fmt.Errorf("failed to bind to port %s: %v", addr, err)
 	}
-	fmt.Println("KV Store TCP server listening on :8080")
+	fmt.Printf("KV Store TCP server listening on %s\n", addr)
 
 	// ==========================================
 	// PHASE 2: BACKGROUND WORKER DEPLOYMENT
@@ -444,7 +444,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if err := StartServer(ctx); err != nil {
+	if err := StartServer(ctx, ":8080"); err != nil {
 		fmt.Printf("[FATAL] Server failed: %v\n", err)
 		os.Exit(1)
 	}

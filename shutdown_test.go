@@ -20,14 +20,14 @@ func TestGracefulShutdown(t *testing.T) {
 	serverDone := make(chan error, 1)
 
 	go func() {
-		serverDone <- StartServer(ctx)
+		serverDone <- StartServer(ctx, ":8081")
 	}()
 
 	// Wait for listener to bind
 	time.Sleep(500 * time.Millisecond)
 
 	// 2. Blast the server with 50 sequential writes
-	conn, err := net.Dial("tcp", "127.0.0.1:8080")
+	conn, err := net.Dial("tcp", "127.0.0.1:8081")
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}
