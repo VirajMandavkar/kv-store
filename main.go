@@ -25,6 +25,18 @@ type walRequest struct {
 
 const MemTableLimit = 100 * 1024 // 100 KB limit for rapid flushing
 
+type Server struct {
+	addr       string
+	walChan    chan walRequest
+	flushChan  chan *SkipList
+	connWg     sync.WaitGroup
+	walWg      sync.WaitGroup
+	activeMem  *SkipList
+	immutMem   []*SkipList
+	sstCounter int
+	mu         sync.RWMutex
+}
+
 var (
 	activeMem  = NewSkipList()
 	immutMem   []*SkipList // Queue of frozen tables waiting for disk I/O
