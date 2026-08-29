@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -26,7 +27,23 @@ func (s *Server) flushMemTable(sl *SkipList, fileID int) error {
 	}
 	defer file.Close()
 
+	bf := NewBloomFilter(1000, 0.01)
+
 	current := sl.head.next[0]
+	for current != nil {
+		bf.Add([]byte(current.key))
+		current = current.next[0]
+	}
+
+	bfBytes := bf.MarshalBinary()
+	if err := binary.Write(file, binary.LittleEndian, uint32(len(bfBytes))); err != nil {
+		return err
+	}
+	if _, err := file.Write(bfBytes); err != nil {
+		return err
+	}
+
+	current = sl.head.next[0]
 	count := 0
 
 	for current != nil {
@@ -60,6 +77,25 @@ func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
 		return "", false
 	}
 	defer file.Close()
+
+	var bfLen uint32
+	if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+		return "", false
+	}
+
+	bfBytes := make([]byte, bfLen)
+	if _, err := io.ReadFull(file, bfBytes); err != nil {
+		return "", false
+	}
+
+	bf, err := UnmarshalBinary(bfBytes)
+	if err != nil {
+		return "", false
+	}
+
+	if !bf.Exists([]byte(targetKey)) {
+		return "", false
+	}
 
 	for {
 		var KeyLen uint32
@@ -96,6 +132,16 @@ func (s *Server) NewSSTableItrator(fileID int) (*SSTableItrator, error) {
 		return nil, err
 	}
 	it := &SSTableItrator{file: file, fileID: fileID}
+
+	var bfLen uint32
+	if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+		return nil, err
+	}
+
+	if _, err := file.Seek(int64(bfLen), io.SeekCurrent); err != nil {
+		file.Close()
+		return nil, err
+	}
 
 	var KeyLen uint32
 	err = binary.Read(file, binary.LittleEndian, &KeyLen)
@@ -164,11 +210,24 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 	}
 
 	// 2. Open the new output file
-	outFile, err := os.OpenFile(filepath.Join(s.addr, fmt.Sprintf("sst_%d.db", outputFileID)), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	outFile, err := os.OpenFile(filepath.Join(s.dataDir, fmt.Sprintf("sst_%d.db", outputFileID)), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create compaction output file: %w", err)
 	}
 	defer outFile.Close()
+
+	bf := NewBloomFilter(5000, 0.01)
+	bfBytes := bf.MarshalBinary()
+
+	err = binary.Write(outFile, binary.LittleEndian, uint32(len(bfBytes)))
+	if err != nil {
+		return err
+	}
+
+	_, err = outFile.Write(bfBytes)
+	if err != nil {
+		return err
+	}
 
 	// 3. The Core Merge Loop
 	for len(iterator) > 0 {
@@ -220,6 +279,8 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 			keyBytes := []byte(winningIt.currentKey)
 			valBytes := []byte(winningIt.currentValue)
 
+			bf.Add(keyBytes)
+
 			keyLen := uint32(len(keyBytes))
 			valLen := uint32(len(valBytes))
 
@@ -248,10 +309,19 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 		// If it hits EOF here, the In-Place Filter at the top will remove it on the next loop.
 		winningIt.Next()
 	}
+	_, err = outFile.Seek(4, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to seek for bloom filter rewrite: %w", err)
+	}
 
+	populatedBytes := bf.MarshalBinary()
+	_, err = outFile.Write(populatedBytes)
+	if err != nil {
+		return fmt.Errorf("failed to rewrite populated bloom filter: %w", err)
+	}
 	// 4. Cleanup Phase: Delete the old, fragmented SSTable files
 	for _, id := range fileIDs {
-		oldFilename := filepath.Join(s.addr, fmt.Sprintf("sst_%d.db", id))
+		oldFilename := filepath.Join(s.dataDir, fmt.Sprintf("sst_%d.db", id))
 		err := os.Remove(oldFilename)
 		if err != nil {
 			fmt.Printf("[WARNING] Failed to delete obsolete files %s: %v\n", oldFilename, err)
