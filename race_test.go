@@ -5,16 +5,16 @@ import (
 	"testing"
 )
 
-func TestSSTCounterRace(t *testing.T) {
+func (s *Server) TestSSTCounterRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 1000; i++ {
-			mu.Lock()
-			sstCounter++
-			mu.Unlock()
+			s.mu.Lock()
+			s.sstCounter++
+			s.mu.Unlock()
 		}
 	}()
 
@@ -22,9 +22,9 @@ func TestSSTCounterRace(t *testing.T) {
 		defer wg.Done()
 		for i := 0; i < 1000; i++ {
 			// GET reads the counter with a read-lock
-			mu.RLock()
-			_ = sstCounter
-			mu.RUnlock()
+			s.mu.RLock()
+			_ = s.sstCounter
+			s.mu.RUnlock()
 		}
 	}()
 

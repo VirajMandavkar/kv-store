@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestMaxPayloadLimit(t *testing.T) {
+func (s *Server) TestMaxPayloadLimit(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Failed to bind listener: %v\n", err)
@@ -20,7 +20,7 @@ func TestMaxPayloadLimit(t *testing.T) {
 		if err != nil {
 			return
 		}
-		handleConnection(conn)
+		s.handleConnection(conn)
 	}()
 
 	clientConn, err := net.Dial("tcp", ln.Addr().String())

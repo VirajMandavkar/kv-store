@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // SSTableItrator acts as a cursor moving line-by-line through a file on disk.
@@ -16,10 +17,10 @@ type SSTableItrator struct {
 }
 
 // flushMemTable takes a frozen SkipList from memory and writes it linearly to an SSTable file.
-func flushMemTable(sl *SkipList, fileID int) error {
-	filename := fmt.Sprintf("sst_%d.db", fileID)
+func (s *Server) flushMemTable(sl *SkipList, fileID int) error {
+	filePath := filepath.Join(s.dataDir, fmt.Sprintf("sst_%d.db", fileID))
 
-	file, err := os.Create(filename)
+	file, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
@@ -47,13 +48,14 @@ func flushMemTable(sl *SkipList, fileID int) error {
 		current = current.next[0]
 		count++
 	}
-	fmt.Printf("[SYSTEM] Flushed %d keys to %s\n", count, filename)
+	fmt.Printf("[SYSTEM] Flushed %d keys to %s\n", count, filePath)
 	return nil
 }
 
 // searchSSTable scans a single file from top to bottom looking for a specific key.
-func searchSSTable(filename, targetKey string) (string, bool) {
-	file, err := os.Open(filename)
+func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
+	filePath := filepath.Join(s.dataDir, filename)
+	file, err := os.Open(filePath)
 	if err != nil {
 		return "", false
 	}
@@ -87,9 +89,9 @@ func searchSSTable(filename, targetKey string) (string, bool) {
 }
 
 // NewSSTableItrator opens a file and loads the very first key/value pair into memory.
-func NewSSTableItrator(fileID int) (*SSTableItrator, error) {
-	filename := fmt.Sprintf("sst_%d.db", fileID)
-	file, err := os.Open(filename)
+func (s *Server) NewSSTableItrator(fileID int) (*SSTableItrator, error) {
+	filePath := filepath.Join(s.dataDir, fmt.Sprintf("sst_%d.db", fileID))
+	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
@@ -147,12 +149,12 @@ func (it *SSTableItrator) Next() {
 
 // CompactSSTables performs a K-way merge. It reads multiple sorted files in parallel,
 // picks the newest version of each key, and writes a single compacted output file.
-func CompactSSTables(fileIDs []int, outputFileID int) error {
+func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 	var iterator []*SSTableItrator
 
 	// 1. Initialize an iterator for every file we want to compact
 	for _, id := range fileIDs {
-		it, err := NewSSTableItrator(id)
+		it, err := s.NewSSTableItrator(id)
 		if err != nil {
 			return fmt.Errorf("failed to initialize iterator for file %d: %w", id, err)
 		}
@@ -162,7 +164,7 @@ func CompactSSTables(fileIDs []int, outputFileID int) error {
 	}
 
 	// 2. Open the new output file
-	outFile, err := os.OpenFile(fmt.Sprintf("sst_%d.db", outputFileID), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	outFile, err := os.OpenFile(filepath.Join(s.addr, fmt.Sprintf("sst_%d.db", outputFileID)), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create compaction output file: %w", err)
 	}
@@ -249,7 +251,7 @@ func CompactSSTables(fileIDs []int, outputFileID int) error {
 
 	// 4. Cleanup Phase: Delete the old, fragmented SSTable files
 	for _, id := range fileIDs {
-		oldFilename := fmt.Sprintf("sst_%d.db", id)
+		oldFilename := filepath.Join(s.addr, fmt.Sprintf("sst_%d.db", id))
 		err := os.Remove(oldFilename)
 		if err != nil {
 			fmt.Printf("[WARNING] Failed to delete obsolete files %s: %v\n", oldFilename, err)

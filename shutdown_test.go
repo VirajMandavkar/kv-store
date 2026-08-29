@@ -6,21 +6,27 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
 func TestGracefulShutdown(t *testing.T) {
+	tempDir := t.TempDir()
+	srv, err := NewServer(":8081", tempDir)
+	if err != nil {
+		t.Fatalf("Failed to create test server: %v", err)
+	}
 	//Clean slate
-	os.Remove("wal.log")
+	os.Remove(filepath.Join(srv.dataDir, "wal.log"))
 
 	// 1. Boot the server with a cancellable context
 	ctx, cancel := context.WithCancel(context.Background())
 	serverDone := make(chan error, 1)
 
 	go func() {
-		serverDone <- StartServer(ctx, ":8081")
+		serverDone <- srv.StartServer(ctx)
 	}()
 
 	// Wait for listener to bind
@@ -52,7 +58,7 @@ func TestGracefulShutdown(t *testing.T) {
 	}
 
 	// 5. Verify absolute data integrity on the disk
-	file, err := os.Open("wal.log")
+	file, err := os.Open(filepath.Join(srv.dataDir, "wal.log"))
 	if err != nil {
 		t.Fatalf("Failed to open WAL: %v", err)
 	}
