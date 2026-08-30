@@ -1,31 +1,48 @@
-name : KV-Store CORE Engine CI
+name: KV-Store CORE Engine CI
 
-on: 
+on:
   push:
     branches: ["main"]
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
   test-and-build:
-    name: Build & Analyze
+    name: Build, test, and analyze
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup Go Environment
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.21'
-    
-    - name: Compile Engine
-      run: go build -v ./...
-    
-    - name: Static Code Analysis
-      run: go vet ./...
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
+          cache: true
+          cache-dependency-path: |
+            go.sum
+            **/*.go
 
-    - name: Detect Data Races
-      run: go test -race -v ./...
+      - name: Download Go modules
+        run: go mod download
+
+      - name: Compile engine
+        run: go build -v ./...
+
+      - name: Run vet
+        run: go vet ./...
+
+      - name: Run unit tests
+        run: go test -count=1 ./...
+
+      - name: Run race-enabled tests
+        run: go test -race -count=1 ./...
+
+      - name: Publish coverage summary
+        run: go test -coverprofile=coverage.out -count=1 ./... && go tool cover -func=coverage.out | tail -n 1
 

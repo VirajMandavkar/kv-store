@@ -92,16 +92,23 @@ func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
 		return "", false
 	}
 	if string(magic) != string(MagicV2) {
-		file.Seek(0, io.SeekStart)
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return "", false
+		}
 	} else {
 		var bfLen uint32
 		if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
 			return "", false
 		}
 
-		// SANITY CHECK: Prevent massive allocations on corrupted files
-		if bfLen == 0 || bfLen > 10*1024*1024 {
+		// SANITY CHECK: Prevent massive allocations on corrupted files.
+		if bfLen < 9 || bfLen > 10*1024*1024 {
 			return "", false
+		}
+		if fileInfo, err := file.Stat(); err == nil {
+			if int64(8)+int64(bfLen) > fileInfo.Size() {
+				return "", false
+			}
 		}
 
 		bfBytes := make([]byte, bfLen)
@@ -117,7 +124,6 @@ func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
 		if !bf.Exists([]byte(targetKey)) {
 			return "", false
 		}
-
 	}
 
 	for {
@@ -161,15 +167,26 @@ func (s *Server) NewSSTableItrator(fileID int) (*SSTableItrator, error) {
 		return nil, err
 	}
 	if string(magic) != string(MagicV2) {
-		file.Seek(0, io.SeekStart)
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			file.Close()
+			return nil, err
+		}
 	} else {
 		var bfLen uint32
 		if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+			file.Close()
 			return nil, err
 		}
-		// SANITY CHECK: Prevent massive allocations on corrupted files
-		if bfLen == 0 || bfLen > 10*1024*1024 {
-			return nil, fmt.Errorf("Corrupted file header")
+		// SANITY CHECK: Prevent massive allocations on corrupted files.
+		if bfLen < 9 || bfLen > 10*1024*1024 {
+			file.Close()
+			return nil, fmt.Errorf("corrupted file header")
+		}
+		if fileInfo, err := file.Stat(); err == nil {
+			if int64(8)+int64(bfLen) > fileInfo.Size() {
+				file.Close()
+				return nil, fmt.Errorf("corrupted file header")
+			}
 		}
 		if _, err := file.Seek(int64(bfLen), io.SeekCurrent); err != nil {
 			file.Close()
@@ -252,6 +269,7 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 
 	bf := NewBloomFilter(20000, 0.01)
 	bfBytes := bf.MarshalBinary()
+	expectedBloomSize := len(bfBytes)
 	if _, err := outFile.Write(MagicV2); err != nil {
 		return err
 	}
@@ -352,6 +370,9 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 	}
 
 	populatedBytes := bf.MarshalBinary()
+	if len(populatedBytes) != expectedBloomSize {
+		return fmt.Errorf("FATAL: bloom filter size changed from %d to %d during compaction", expectedBloomSize, len(populatedBytes))
+	}
 	_, err = outFile.Write(populatedBytes)
 	if err != nil {
 		return fmt.Errorf("failed to rewrite populated bloom filter: %w", err)

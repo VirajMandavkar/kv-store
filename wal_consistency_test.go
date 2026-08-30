@@ -16,7 +16,7 @@ import (
 
 func TestSplitBrainConsistency(t *testing.T) {
 	tempDir := t.TempDir()
-	srv, err := NewServer(":8082", tempDir)
+	srv, err := NewServer("127.0.0.1:0", tempDir)
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
@@ -29,13 +29,13 @@ func TestSplitBrainConsistency(t *testing.T) {
 	go func() {
 		_ = srv.StartServer(ctx)
 	}()
-	time.Sleep(100 * time.Millisecond) // Give the TCP socket a moment to bind
+	addr := waitForServerAddress(t, srv)
 
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func(val int) {
 			defer wg.Done()
-			conn, err := net.Dial("tcp", "127.0.0.1:8082")
+			conn, err := net.Dial("tcp", addr)
 			if err != nil {
 				return
 			}
@@ -75,7 +75,7 @@ func TestSplitBrainConsistency(t *testing.T) {
 		t.Fatalf("Failed to scan the file : %v", scanner.Err())
 	}
 
-	conn, err := net.Dial("tcp", "127.0.0.1:8082")
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("Failed to connect for GET: %v", err)
 	}

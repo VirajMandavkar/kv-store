@@ -15,6 +15,12 @@ type BloomFilter struct {
 }
 
 func NewBloomFilter(n int, p float64) *BloomFilter {
+	if n <= 0 {
+		n = 100 // Safe default
+	}
+	if p <= 0.0 || p >= 1.0 {
+		p = 0.01 // Safe default
+	}
 	m := uint32((-float64(n) * math.Log(p)) / math.Pow(math.Log(2), 2))
 	k := uint8((float64(m) * math.Log(2)) / float64(n))
 
@@ -83,6 +89,9 @@ func UnmarshalBinary(data []byte) (*BloomFilter, error) {
 		return nil, errors.New("corrupted bloom filter: m or k is zero")
 	}
 	bitsetLen := binary.LittleEndian.Uint32(data[5:9])
+	if bitsetLen == 0 || bitsetLen > 10*1024*1024 { // 10MB limit
+		return nil, errors.New("corrupted bloom filter: invalid bitset length")
+	}
 
 	expectedTotalSize := 9 + int(bitsetLen)
 	if len(data) != expectedTotalSize {
