@@ -92,26 +92,32 @@ func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
 		return "", false
 	}
 	if string(magic) != string(MagicV2) {
-		return "", false
-	}
+		file.Seek(0, io.SeekStart)
+	} else {
+		var bfLen uint32
+		if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+			return "", false
+		}
 
-	var bfLen uint32
-	if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
-		return "", false
-	}
+		// SANITY CHECK: Prevent massive allocations on corrupted files
+		if bfLen == 0 || bfLen > 10*1024*1024 {
+			return "", false
+		}
 
-	bfBytes := make([]byte, bfLen)
-	if _, err := io.ReadFull(file, bfBytes); err != nil {
-		return "", false
-	}
+		bfBytes := make([]byte, bfLen)
+		if _, err := io.ReadFull(file, bfBytes); err != nil {
+			return "", false
+		}
 
-	bf, err := UnmarshalBinary(bfBytes)
-	if err != nil {
-		return "", false
-	}
+		bf, err := UnmarshalBinary(bfBytes)
+		if err != nil {
+			return "", false
+		}
 
-	if !bf.Exists([]byte(targetKey)) {
-		return "", false
+		if !bf.Exists([]byte(targetKey)) {
+			return "", false
+		}
+
 	}
 
 	for {
@@ -155,17 +161,20 @@ func (s *Server) NewSSTableItrator(fileID int) (*SSTableItrator, error) {
 		return nil, err
 	}
 	if string(magic) != string(MagicV2) {
-		return nil, fmt.Errorf("unsupported SSTable format")
-	}
-
-	var bfLen uint32
-	if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
-		return nil, err
-	}
-
-	if _, err := file.Seek(int64(bfLen), io.SeekCurrent); err != nil {
-		file.Close()
-		return nil, err
+		file.Seek(0, io.SeekStart)
+	} else {
+		var bfLen uint32
+		if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+			return nil, err
+		}
+		// SANITY CHECK: Prevent massive allocations on corrupted files
+		if bfLen == 0 || bfLen > 10*1024*1024 {
+			return nil, fmt.Errorf("Corrupted file header")
+		}
+		if _, err := file.Seek(int64(bfLen), io.SeekCurrent); err != nil {
+			file.Close()
+			return nil, err
+		}
 	}
 
 	var KeyLen uint32
