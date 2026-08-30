@@ -79,6 +79,9 @@ func UnmarshalBinary(data []byte) (*BloomFilter, error) {
 
 	m := binary.LittleEndian.Uint32(data[0:4])
 	k := data[4]
+	if m == 0 || k == 0 {
+		return nil, errors.New("corrupted bloom filter: m or k is zero")
+	}
 	bitsetLen := binary.LittleEndian.Uint32(data[5:9])
 
 	expectedTotalSize := 9 + int(bitsetLen)

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 )
 
+var MagicV2 = []byte{'K', 'V', 'S', '2'}
+
 // SSTableItrator acts as a cursor moving line-by-line through a file on disk.
 type SSTableItrator struct {
 	file         *os.File
@@ -27,7 +29,11 @@ func (s *Server) flushMemTable(sl *SkipList, fileID int) error {
 	}
 	defer file.Close()
 
-	bf := NewBloomFilter(1000, 0.01)
+	expectedKeys := sl.keyCount
+	if expectedKeys <= 0 {
+		expectedKeys = 100
+	}
+	bf := NewBloomFilter(expectedKeys, 0.01)
 
 	current := sl.head.next[0]
 	for current != nil {
@@ -36,6 +42,9 @@ func (s *Server) flushMemTable(sl *SkipList, fileID int) error {
 	}
 
 	bfBytes := bf.MarshalBinary()
+	if _, err := file.Write(MagicV2); err != nil {
+		return err
+	}
 	if err := binary.Write(file, binary.LittleEndian, uint32(len(bfBytes))); err != nil {
 		return err
 	}
@@ -77,6 +86,14 @@ func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
 		return "", false
 	}
 	defer file.Close()
+
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return "", false
+	}
+	if string(magic) != string(MagicV2) {
+		return "", false
+	}
 
 	var bfLen uint32
 	if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
@@ -132,6 +149,14 @@ func (s *Server) NewSSTableItrator(fileID int) (*SSTableItrator, error) {
 		return nil, err
 	}
 	it := &SSTableItrator{file: file, fileID: fileID}
+
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return nil, err
+	}
+	if string(magic) != string(MagicV2) {
+		return nil, fmt.Errorf("unsupported SSTable format")
+	}
 
 	var bfLen uint32
 	if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
@@ -216,8 +241,11 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 	}
 	defer outFile.Close()
 
-	bf := NewBloomFilter(5000, 0.01)
+	bf := NewBloomFilter(20000, 0.01)
 	bfBytes := bf.MarshalBinary()
+	if _, err := outFile.Write(MagicV2); err != nil {
+		return err
+	}
 
 	err = binary.Write(outFile, binary.LittleEndian, uint32(len(bfBytes)))
 	if err != nil {
@@ -309,7 +337,7 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 		// If it hits EOF here, the In-Place Filter at the top will remove it on the next loop.
 		winningIt.Next()
 	}
-	_, err = outFile.Seek(4, io.SeekStart)
+	_, err = outFile.Seek(8, io.SeekStart)
 	if err != nil {
 		return fmt.Errorf("failed to seek for bloom filter rewrite: %w", err)
 	}
