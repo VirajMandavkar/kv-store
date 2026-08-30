@@ -324,6 +324,9 @@ func (s *Server) StartServer(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to bind to port %s: %v", s.addr, err)
 	}
+	s.mu.Lock()
+	s.addr = ln.Addr().String()
+	s.mu.Unlock()
 	fmt.Printf("KV Store TCP server listening on %s\n", s.addr)
 
 	// ==========================================

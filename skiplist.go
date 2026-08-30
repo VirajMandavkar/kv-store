@@ -20,9 +20,10 @@ type Node struct {
 
 // SkipList manages the entry point and the current active limits of the tracks.
 type SkipList struct {
-	head  *Node
-	level int // The current highest active track in the system
-	size  int // Exact byte size of all keys and values (used for our 1MB RAM flush)
+	head     *Node
+	level    int // The current highest active track in the system
+	size     int // Exact byte size of all keys and values (used for our 1MB RAM flush)
+	keyCount int
 }
 
 // NewSkipList initializes a fresh MemTable with a dummy starting line.
@@ -33,9 +34,10 @@ func NewSkipList() *SkipList {
 		next:  make([]*Node, MaxLevel),
 	}
 	return &SkipList{
-		head:  head,
-		level: 0,
-		size:  0,
+		head:     head,
+		level:    0,
+		size:     0,
+		keyCount: 0,
 	}
 }
 
@@ -106,6 +108,7 @@ func (sl *SkipList) Put(key, value string) {
 
 	// Add the exact byte weight of the new data to our RAM tracker.
 	sl.size += len(key) + len(value)
+	sl.keyCount++
 }
 
 // Get traverses the tracks to find a specific key.

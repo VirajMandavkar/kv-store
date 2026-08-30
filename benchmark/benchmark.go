@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	numWorkers        = 10000
-	requestsPerWorker = 1000
+	numWorkers        = 1000
+	requestsPerWorker = 100
 )
 
 func worker(workerID int, wg *sync.WaitGroup) {

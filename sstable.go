@@ -3,9 +3,12 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
+
+var MagicV2 = []byte{'K', 'V', 'S', '2'}
 
 // SSTableItrator acts as a cursor moving line-by-line through a file on disk.
 type SSTableItrator struct {
@@ -26,7 +29,30 @@ func (s *Server) flushMemTable(sl *SkipList, fileID int) error {
 	}
 	defer file.Close()
 
+	expectedKeys := sl.keyCount
+	if expectedKeys <= 0 {
+		expectedKeys = 100
+	}
+	bf := NewBloomFilter(expectedKeys, 0.01)
+
 	current := sl.head.next[0]
+	for current != nil {
+		bf.Add([]byte(current.key))
+		current = current.next[0]
+	}
+
+	bfBytes := bf.MarshalBinary()
+	if _, err := file.Write(MagicV2); err != nil {
+		return err
+	}
+	if err := binary.Write(file, binary.LittleEndian, uint32(len(bfBytes))); err != nil {
+		return err
+	}
+	if _, err := file.Write(bfBytes); err != nil {
+		return err
+	}
+
+	current = sl.head.next[0]
 	count := 0
 
 	for current != nil {
@@ -60,6 +86,45 @@ func (s *Server) searchSSTable(filename, targetKey string) (string, bool) {
 		return "", false
 	}
 	defer file.Close()
+
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return "", false
+	}
+	if string(magic) != string(MagicV2) {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return "", false
+		}
+	} else {
+		var bfLen uint32
+		if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+			return "", false
+		}
+
+		// SANITY CHECK: Prevent massive allocations on corrupted files.
+		if bfLen < 9 || bfLen > 10*1024*1024 {
+			return "", false
+		}
+		if fileInfo, err := file.Stat(); err == nil {
+			if int64(8)+int64(bfLen) > fileInfo.Size() {
+				return "", false
+			}
+		}
+
+		bfBytes := make([]byte, bfLen)
+		if _, err := io.ReadFull(file, bfBytes); err != nil {
+			return "", false
+		}
+
+		bf, err := UnmarshalBinary(bfBytes)
+		if err != nil {
+			return "", false
+		}
+
+		if !bf.Exists([]byte(targetKey)) {
+			return "", false
+		}
+	}
 
 	for {
 		var KeyLen uint32
@@ -96,6 +161,38 @@ func (s *Server) NewSSTableItrator(fileID int) (*SSTableItrator, error) {
 		return nil, err
 	}
 	it := &SSTableItrator{file: file, fileID: fileID}
+
+	magic := make([]byte, 4)
+	if _, err := io.ReadFull(file, magic); err != nil {
+		return nil, err
+	}
+	if string(magic) != string(MagicV2) {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			file.Close()
+			return nil, err
+		}
+	} else {
+		var bfLen uint32
+		if err := binary.Read(file, binary.LittleEndian, &bfLen); err != nil {
+			file.Close()
+			return nil, err
+		}
+		// SANITY CHECK: Prevent massive allocations on corrupted files.
+		if bfLen < 9 || bfLen > 10*1024*1024 {
+			file.Close()
+			return nil, fmt.Errorf("corrupted file header")
+		}
+		if fileInfo, err := file.Stat(); err == nil {
+			if int64(8)+int64(bfLen) > fileInfo.Size() {
+				file.Close()
+				return nil, fmt.Errorf("corrupted file header")
+			}
+		}
+		if _, err := file.Seek(int64(bfLen), io.SeekCurrent); err != nil {
+			file.Close()
+			return nil, err
+		}
+	}
 
 	var KeyLen uint32
 	err = binary.Read(file, binary.LittleEndian, &KeyLen)
@@ -164,11 +261,28 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 	}
 
 	// 2. Open the new output file
-	outFile, err := os.OpenFile(filepath.Join(s.addr, fmt.Sprintf("sst_%d.db", outputFileID)), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	outFile, err := os.OpenFile(filepath.Join(s.dataDir, fmt.Sprintf("sst_%d.db", outputFileID)), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("failed to create compaction output file: %w", err)
 	}
 	defer outFile.Close()
+
+	bf := NewBloomFilter(20000, 0.01)
+	bfBytes := bf.MarshalBinary()
+	expectedBloomSize := len(bfBytes)
+	if _, err := outFile.Write(MagicV2); err != nil {
+		return err
+	}
+
+	err = binary.Write(outFile, binary.LittleEndian, uint32(len(bfBytes)))
+	if err != nil {
+		return err
+	}
+
+	_, err = outFile.Write(bfBytes)
+	if err != nil {
+		return err
+	}
 
 	// 3. The Core Merge Loop
 	for len(iterator) > 0 {
@@ -220,6 +334,8 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 			keyBytes := []byte(winningIt.currentKey)
 			valBytes := []byte(winningIt.currentValue)
 
+			bf.Add(keyBytes)
+
 			keyLen := uint32(len(keyBytes))
 			valLen := uint32(len(valBytes))
 
@@ -248,10 +364,22 @@ func (s *Server) CompactSSTables(fileIDs []int, outputFileID int) error {
 		// If it hits EOF here, the In-Place Filter at the top will remove it on the next loop.
 		winningIt.Next()
 	}
+	_, err = outFile.Seek(8, io.SeekStart)
+	if err != nil {
+		return fmt.Errorf("failed to seek for bloom filter rewrite: %w", err)
+	}
 
+	populatedBytes := bf.MarshalBinary()
+	if len(populatedBytes) != expectedBloomSize {
+		return fmt.Errorf("FATAL: bloom filter size changed from %d to %d during compaction", expectedBloomSize, len(populatedBytes))
+	}
+	_, err = outFile.Write(populatedBytes)
+	if err != nil {
+		return fmt.Errorf("failed to rewrite populated bloom filter: %w", err)
+	}
 	// 4. Cleanup Phase: Delete the old, fragmented SSTable files
 	for _, id := range fileIDs {
-		oldFilename := filepath.Join(s.addr, fmt.Sprintf("sst_%d.db", id))
+		oldFilename := filepath.Join(s.dataDir, fmt.Sprintf("sst_%d.db", id))
 		err := os.Remove(oldFilename)
 		if err != nil {
 			fmt.Printf("[WARNING] Failed to delete obsolete files %s: %v\n", oldFilename, err)

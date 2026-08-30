@@ -14,7 +14,7 @@ import (
 
 func TestGracefulShutdown(t *testing.T) {
 	tempDir := t.TempDir()
-	srv, err := NewServer(":8081", tempDir)
+	srv, err := NewServer("127.0.0.1:0", tempDir)
 	if err != nil {
 		t.Fatalf("Failed to create test server: %v", err)
 	}
@@ -28,12 +28,10 @@ func TestGracefulShutdown(t *testing.T) {
 	go func() {
 		serverDone <- srv.StartServer(ctx)
 	}()
-
-	// Wait for listener to bind
-	time.Sleep(500 * time.Millisecond)
+	addr := waitForServerAddress(t, srv)
 
 	// 2. Blast the server with 50 sequential writes
-	conn, err := net.Dial("tcp", "127.0.0.1:8081")
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("Failed to connect: %v", err)
 	}
