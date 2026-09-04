@@ -95,9 +95,12 @@ func TestSearchSSTableLegacyFormatCompatibility(t *testing.T) {
 		t.Fatalf("failed to close legacy SSTable: %v", err)
 	}
 
-	got, ok := srv.searchSSTable(filename, key)
+	got, ok, isDeleted := srv.searchSSTable(filename, key)
 	if !ok {
 		t.Fatalf("legacy SSTable should still be readable without MagicV2 header")
+	}
+	if isDeleted {
+		t.Fatal("legacy put record should not be reported as a tombstone")
 	}
 	if got != value {
 		t.Fatalf("legacy SSTable returned %q, want %q", got, value)

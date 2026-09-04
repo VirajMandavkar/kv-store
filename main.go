@@ -125,15 +125,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 				key := parts[1]
 				var value string
 				var exists bool
+				var isDeleted bool
 
 				// Check active RAM
 				s.mu.RLock()
-				value, exists = s.activeMem.Get(key)
+				value, exists, isDeleted = s.activeMem.Get(key)
 
 				// Check queued frozen RAM (search backwards for most recent)
 				if !exists {
 					for i := len(s.immutMem) - 1; i >= 0; i-- {
-						value, exists = s.immutMem[i].Get(key)
+						value, exists, isDeleted = s.immutMem[i].Get(key)
 						if exists {
 							break
 						}
@@ -149,7 +150,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 					for i := maxFiles - 1; i >= 0; i-- {
 						filename := fmt.Sprintf("sst_%d.db", i)
-						value, exists = s.searchSSTable(filename, key)
+						value, exists, isDeleted = s.searchSSTable(filename, key)
 						if exists {
 							break
 						}
@@ -157,7 +158,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 				}
 
 				// Resolve Tombstones
-				if exists && value != "<TOMBSTONE>" {
+				if exists && !isDeleted {
 					response = value
 				} else {
 					response = "Key Don't Exist"
@@ -229,7 +230,7 @@ func (s *Server) loadWAL() {
 			s.activeMem.Put(key, value)
 		} else if command == "DEL" && len(parts) == 2 {
 			key := parts[1]
-			s.activeMem.Put(key, "<TOMBSTONE>")
+			s.activeMem.Delete(key)
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -393,7 +394,7 @@ func (s *Server) StartServer(ctx context.Context) error {
 					case "SET":
 						s.activeMem.Put(r.key, r.value)
 					case "DEL":
-						s.activeMem.Put(r.key, "<TOMBSTONE>")
+						s.activeMem.Delete(r.key)
 					}
 
 					if s.activeMem.size >= MemTableLimit {
