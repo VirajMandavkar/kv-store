@@ -6,16 +6,19 @@ import (
 
 // MaxLevel sets the absolute maximum height our SkipList express lanes can reach.
 // 12 levels can efficiently support around 4096 nodes (2^12) with O(log N) speed.
-const MaxLevel = 12
+
+const (
+	RecordPut byte = 0x00
+	RecordDel byte = 0x01
+	MaxLevel       = 12
+)
 
 // Node represents a single station (Key-Value pair) in the database.
 type Node struct {
-	key   string
-	value string
-	// next holds an array of memory addresses.
-	// next[0] points to the next station on the local track.
-	// next[1] points to the next station on the express track, etc.
-	next []*Node
+	key         string
+	value       string
+	next        []*Node
+	isTombStone bool
 }
 
 // SkipList manages the entry point and the current active limits of the tracks.
@@ -29,9 +32,10 @@ type SkipList struct {
 // NewSkipList initializes a fresh MemTable with a dummy starting line.
 func NewSkipList() *SkipList {
 	head := &Node{
-		key:   "",
-		value: "",
-		next:  make([]*Node, MaxLevel),
+		key:         "",
+		value:       "",
+		next:        make([]*Node, MaxLevel),
+		isTombStone: false,
 	}
 	return &SkipList{
 		head:     head,
@@ -52,67 +56,101 @@ func rollLevel() int {
 }
 
 // Put inserts a new key-value pair, or updates an existing one.
+// Put inserts a new key-value pair, or updates an existing one.
 func (sl *SkipList) Put(key, value string) {
-	// 1. The Breadcrumb Trail
-	// This array stores the last node we visited before dropping down a level.
 	update := make([]*Node, MaxLevel)
 	current := sl.head
 
-	// 2. The Top-Down Search
 	for i := sl.level; i >= 0; i-- {
-		// As long as the next station on this track is less than our target key, move forward.
 		for current.next[i] != nil && current.next[i].key < key {
 			current = current.next[i]
 		}
-		// We've gone as far as we can on track 'i'. Leave a breadcrumb.
 		update[i] = current
 	}
-
-	// 3. Drop to the local track (Level 0) to check the station immediately in front of us.
 	current = current.next[0]
 
-	// 4. Update Existing Key
-	// If the station exists and matches our key, update the value and recalculate RAM usage.
+	// Update Existing Key (or resurrect a dead one)
 	if current != nil && current.key == key {
-		sl.size -= len(current.value) // Remove old string length
-		sl.size += len(value)         // Add new string length
+		sl.size -= len(current.value)
+		sl.size += len(value)
 		current.value = value
-		return // Exit early
+		current.isTombStone = false // Resurrect the key
+		return
 	}
 
-	// 5. Insert Brand New Key
+	// Insert Brand New Key
 	newLevel := rollLevel()
-
-	// If our new node rolled a track higher than the current system max,
-	// initialize those upper tracks starting from the HEAD.
 	if newLevel > sl.level {
 		for i := sl.level + 1; i <= newLevel; i++ {
 			update[i] = sl.head
 		}
-		sl.level = newLevel // Raise the system roof
+		sl.level = newLevel
 	}
 
-	// Build the physical node in RAM
 	newNode := &Node{
-		key:   key,
-		value: value,
-		next:  make([]*Node, newLevel+1),
+		key:         key,
+		value:       value,
+		next:        make([]*Node, newLevel+1),
+		isTombStone: false,
 	}
 
-	// 6. The Splice
-	// Use our breadcrumbs to wire the new node into the existing tracks.
 	for i := 0; i <= newLevel; i++ {
-		newNode.next[i] = update[i].next[i] // New node points to the next station
-		update[i].next[i] = newNode         // Breadcrumb points to the new node
+		newNode.next[i] = update[i].next[i]
+		update[i].next[i] = newNode
 	}
 
-	// Add the exact byte weight of the new data to our RAM tracker.
 	sl.size += len(key) + len(value)
 	sl.keyCount++
 }
 
+// Delete inserts a tombstone to mask older versions of this key.
+func (sl *SkipList) Delete(key string) {
+	update := make([]*Node, MaxLevel)
+	current := sl.head
+
+	for i := sl.level; i >= 0; i-- {
+		for current.next[i] != nil && current.next[i].key < key {
+			current = current.next[i]
+		}
+		update[i] = current
+	}
+	current = current.next[0]
+
+	// Key is already in memory; turn it into a tombstone
+	if current != nil && current.key == key {
+		sl.size -= len(current.value) // Reclaim the RAM used by the old value
+		current.value = ""            // Wipe the payload
+		current.isTombStone = true    // Mark as dead
+		return
+	}
+
+	// Key is not in memory; insert a fresh tombstone shield
+	newLevel := rollLevel()
+	if newLevel > sl.level {
+		for i := sl.level + 1; i <= newLevel; i++ {
+			update[i] = sl.head
+		}
+		sl.level = newLevel
+	}
+
+	newNode := &Node{
+		key:         key,
+		value:       "", // No payload
+		next:        make([]*Node, newLevel+1),
+		isTombStone: true, // Born dead
+	}
+
+	for i := 0; i <= newLevel; i++ {
+		newNode.next[i] = update[i].next[i]
+		update[i].next[i] = newNode
+	}
+
+	sl.size += len(key) // Only the key takes up RAM
+	sl.keyCount++
+}
+
 // Get traverses the tracks to find a specific key.
-func (sl *SkipList) Get(key string) (string, bool) {
+func (sl *SkipList) Get(key string) (string, bool, bool) {
 	current := sl.head
 
 	// Rapidly skip down the express lanes
@@ -127,8 +165,8 @@ func (sl *SkipList) Get(key string) (string, bool) {
 
 	// Check if it's the exact match
 	if current != nil && current.key == key {
-		return current.value, true
+		return current.value, true, current.isTombStone
 	}
 
-	return "", false // Key does not exist
+	return "", false, false // Key does not exist
 }

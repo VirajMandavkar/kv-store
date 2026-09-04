@@ -22,10 +22,10 @@ func TestSearchSSTableVersionedFormat(t *testing.T) {
 		t.Fatalf("flushMemTable returned an error: %v", err)
 	}
 
-	if got, ok := srv.searchSSTable("sst_1.db", "alpha"); !ok || got != "one" {
-		t.Fatalf("searchSSTable returned (%q, %v), want (%q, true)", got, ok, "one")
+	if got, ok, isDeleted := srv.searchSSTable("sst_1.db", "alpha"); !ok || isDeleted || got != "one" {
+		t.Fatalf("searchSSTable returned (%q, %v, %v), want (%q, true, false)", got, ok, isDeleted, "one")
 	}
-	if _, ok := srv.searchSSTable("sst_1.db", "missing"); ok {
+	if _, ok, isDeleted := srv.searchSSTable("sst_1.db", "missing"); ok || isDeleted {
 		t.Fatal("searchSSTable should reject a missing key")
 	}
 }
@@ -100,8 +100,8 @@ func TestCompactSSTablesProducesReadableOutput(t *testing.T) {
 	}
 
 	for key, want := range map[string]string{"a": "1", "b": "2", "c": "updated"} {
-		got, ok := srv.searchSSTable("sst_12.db", key)
-		if !ok {
+		got, ok, isDeleted := srv.searchSSTable("sst_12.db", key)
+		if !ok || isDeleted {
 			t.Fatalf("compacted SSTable is missing key %q", key)
 		}
 		if got != want {
